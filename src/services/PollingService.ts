@@ -1,0 +1,758 @@
+import { WorkflowRepository } from '../repositories/WorkflowRepository';
+import { WorkflowService } from './WorkflowService';
+import { CredentialRepository } from '../repositories/CredentialRepository';
+import { BasecampAuthService } from './BasecampAuthService';
+import { SlackAuthService } from './SlackAuthService';
+import { GoogleAuthService } from './GoogleAuthService';
+import { TriggerStateModel } from '../db/models/TriggerStateModel';
+
+interface TriggerNodeConfig {
+    triggerType: string;
+    appType?: string;
+    eventType?: string;
+    credentialId?: string;
+    triggerMode?: 'polling' | 'instant';
+    pollIntervalMinutes?: number;
+    // basecamp
+    projectId?: string;
+    todolistId?: string;
+    // google drive
+    fileId?: string;
+    folderId?: string;
+    // google sheets
+    spreadsheetId?: string;
+    sheetName?: string;
+    // slack
+    slackChannelId?: string;
+    // email
+    labelFilter?: string;
+}
+
+interface PollableNode {
+    workflowId: string;
+    nodeId: string;
+    config: TriggerNodeConfig;
+}
+
+export class PollingService {
+    private intervals: Map<string, ReturnType<typeof setInterval>> = new Map();
+
+    /**
+     * Per-node poll mutex.
+     *
+     * Multiple poll requests for the same (workflowId, nodeId) can arrive
+     * concurrently — most commonly when an external service (e.g. Google
+     * Drive) sends several push notifications for what is logically one
+     * change, but also when a push arrives while the periodic fallback poll
+     * is still running. Without serialisation each concurrent caller would:
+     *   1) read the same `lastSeenId` from TriggerStateModel,
+     *   2) compute the same "new" item(s),
+     *   3) call `workflowService.trigger(...)`,
+     * producing N duplicate executions for one logical event (visible to
+     * the user as N identical success/failure emails for a single new row).
+     *
+     * Chaining polls via this map guarantees the next caller observes the
+     * advanced cursor written by the previous one and exits cleanly with
+     * `items: []`.
+     */
+    private readonly pollLocks: Map<string, Promise<void>> = new Map();
+
+    constructor(
+        private workflowRepo: WorkflowRepository,
+        private workflowService: WorkflowService,
+        private credentialRepo: CredentialRepository,
+        private basecampAuth: BasecampAuthService,
+        private slackAuth: SlackAuthService,
+        private googleAuth: GoogleAuthService,
+    ) {}
+
+    async start(): Promise<void> {
+        const { data: workflows } = await this.workflowRepo.findAll(1000);
+        let count = 0;
+
+        for (const workflow of workflows) {
+            count += this.registerWorkflow(workflow.id, workflow.nodes ?? []);
+        }
+
+        // console.log(`[PollingService] Started ${count} polling trigger(s)`);
+    }
+
+    async refresh(workflowId: string): Promise<void> {
+        this.unregisterWorkflow(workflowId);
+
+        const workflow = await this.workflowRepo.findById(workflowId);
+        if (!workflow) return;
+
+        this.registerWorkflow(workflowId, workflow.nodes ?? []);
+    }
+
+    stop(): void {
+        for (const [, interval] of this.intervals) clearInterval(interval);
+        this.intervals.clear();
+        // console.log('[PollingService] All polling triggers stopped');
+    }
+
+    // ── internals ────────────────────────────────────────────────────────
+
+    private registerWorkflow(
+        workflowId: string,
+        nodes: Array<{ id: string; type: string; config: Record<string, unknown> }>,
+    ): number {
+        const pollableNodes: PollableNode[] = (nodes ?? [])
+            .filter((n) => {
+                if (n.type !== 'trigger') return false;
+                const cfg = n.config as unknown as TriggerNodeConfig;
+                return cfg.triggerType === 'app_event' || cfg.triggerType === 'email';
+                // Instant-mode nodes remain in polling as a 1-minute safety-net
+                // fallback. PushSubscriptionService handles native push registration
+                // for supported services (GDrive/GSheets/Basecamp) so those arrive
+                // near-instantly; the 1-min poll catches anything that slips through.
+            })
+            .map((n) => ({
+                workflowId,
+                nodeId: n.id,
+                config: n.config as unknown as TriggerNodeConfig,
+            }));
+
+        for (const pn of pollableNodes) {
+            this.registerPollable(pn);
+        }
+
+        return pollableNodes.length;
+    }
+
+    private unregisterWorkflow(workflowId: string): void {
+        for (const [key, interval] of this.intervals) {
+            if (key.startsWith(`${workflowId}::`)) {
+                clearInterval(interval);
+                this.intervals.delete(key);
+            }
+        }
+    }
+
+    /**
+     * Run the poll logic once for a specific trigger node.
+     * Used by PushSubscriptionService when a push notification arrives so the
+     * workflow fires immediately without waiting for the next polling cycle.
+     */
+    async pollOnce(workflowId: string, nodeId: string): Promise<void> {
+        const workflow = await this.workflowRepo.findById(workflowId);
+        if (!workflow) return;
+
+        const node = (workflow.nodes ?? []).find(
+            (n: { id: string; type: string }) => n.id === nodeId && n.type === 'trigger',
+        );
+        if (!node) return;
+
+        const pn: PollableNode = {
+            workflowId,
+            nodeId,
+            config: node.config as unknown as TriggerNodeConfig,
+        };
+        await this.serializedPoll(pn);
+    }
+
+    /**
+     * Wraps `poll()` in a per-(workflowId, nodeId) Promise chain so concurrent
+     * callers run sequentially. See `pollLocks` doc-comment for the full
+     * rationale (deduplicates multi-push-notification races).
+     */
+    private serializedPoll(pn: PollableNode): Promise<void> {
+        const key = `${pn.workflowId}::${pn.nodeId}`;
+        const previous = this.pollLocks.get(key) ?? Promise.resolve();
+        const current = previous
+            .catch(() => { /* swallow predecessor errors so the chain continues */ })
+            .then(() => this.poll(pn));
+
+        this.pollLocks.set(key, current);
+        current.finally(() => {
+            // Only clear the entry if no newer poll has chained on top of us.
+            if (this.pollLocks.get(key) === current) this.pollLocks.delete(key);
+        });
+        return current;
+    }
+
+    private registerPollable(pn: PollableNode): void {
+        const key = `${pn.workflowId}::${pn.nodeId}`;
+        const existing = this.intervals.get(key);
+        if (existing) clearInterval(existing);
+
+        // Instant-mode nodes use a 1-minute interval as a reliable safety net.
+        // Native push subscriptions (GDrive/GSheets/Basecamp) will call pollOnce()
+        // immediately when the event fires, so in practice the lag is near-zero.
+        const intervalMs =
+            pn.config.triggerMode === 'instant'
+                ? 60_000
+                : (pn.config.pollIntervalMinutes ?? 5) * 60_000;
+
+        // Run the first poll immediately, then set up the interval
+        this.serializedPoll(pn).catch((err) =>
+            console.error(`[PollingService] Initial poll error ${key}:`, err)
+        );
+
+        const interval = setInterval(async () => {
+            try {
+                await this.serializedPoll(pn);
+            } catch (err) {
+                console.error(`[PollingService] Poll error ${key}:`, err);
+            }
+        }, intervalMs);
+
+        this.intervals.set(key, interval);
+    }
+
+    /**
+     * Build a short fingerprint of the config fields that, if changed,
+     * invalidate the stored poll cursor (lastSeenId).  Any change to these
+     * fields means the cursor is no longer meaningful for the new target.
+     */
+    private configFingerprint(cfg: TriggerNodeConfig): string {
+        return [
+            cfg.appType,
+            cfg.eventType,
+            cfg.credentialId,
+            cfg.spreadsheetId,
+            cfg.sheetName,
+            cfg.fileId,
+            cfg.folderId,
+            cfg.slackChannelId,
+            cfg.projectId,
+            cfg.todolistId,
+            cfg.labelFilter,
+        ].map((v) => v ?? '').join('|');
+    }
+
+    private async poll(pn: PollableNode): Promise<void> {
+        const key = `${pn.workflowId}::${pn.nodeId}`;
+        const fingerprint = this.configFingerprint(pn.config);
+
+        // Load or create state
+        let state = await TriggerStateModel.findOne({
+            workflowId: pn.workflowId,
+            nodeId: pn.nodeId,
+        });
+        if (!state) {
+            state = await TriggerStateModel.create({
+                workflowId: pn.workflowId,
+                nodeId: pn.nodeId,
+                lastPollAt: new Date(),
+                lastSeenId: '',
+                metadata: { configFingerprint: fingerprint },
+            });
+            return; // First creation — skip triggering, start tracking from now
+        }
+
+        // If any key config field changed (e.g. new spreadsheet / file / channel),
+        // reset the cursor so we start tracking from now on the new target.
+        const storedFingerprint = (state.metadata as Record<string, unknown>).configFingerprint as string | undefined;
+        if (storedFingerprint !== fingerprint) {
+            await TriggerStateModel.updateOne(
+                { workflowId: pn.workflowId, nodeId: pn.nodeId },
+                { $set: { lastPollAt: new Date(), lastSeenId: '', metadata: { configFingerprint: fingerprint } } },
+            );
+            return; // Skip this cycle — next poll will track from now
+        }
+
+        const since = state.lastPollAt;
+        let newItems: Array<Record<string, unknown>> = [];
+        let newLastSeenId = state.lastSeenId;
+
+        try {
+            if (pn.config.triggerType === 'app_event') {
+                ({ items: newItems, lastSeenId: newLastSeenId } = await this.pollAppEvent(pn.config, since, state.lastSeenId));
+            } else if (pn.config.triggerType === 'email') {
+                ({ items: newItems, lastSeenId: newLastSeenId } = await this.pollEmail(pn.config, since, state.lastSeenId));
+            }
+        } catch (err) {
+            console.error(`[PollingService] Adapter error ${key}:`, err);
+            return;
+        }
+
+        if (newItems.length > 0) {
+            try {
+                await this.workflowService.trigger(
+                    pn.workflowId,
+                    {
+                        items: newItems,
+                        count: newItems.length,
+                        polledAt: new Date().toISOString(),
+                    },
+                    'api',
+                    pn.nodeId,
+                );
+                // console.log(`[PollingService] Triggered ${key} with ${newItems.length} new item(s)`);
+            } catch (err) {
+                console.error(`[PollingService] Trigger error ${key}:`, err);
+            }
+        }
+
+        // Update state (persist fingerprint so future polls can detect config changes)
+        await TriggerStateModel.updateOne(
+            { workflowId: pn.workflowId, nodeId: pn.nodeId },
+            { $set: { lastPollAt: new Date(), lastSeenId: newLastSeenId, 'metadata.configFingerprint': fingerprint } },
+        );
+    }
+
+    // ── App Event Adapters ───────────────────────────────────────────────
+
+    private async pollAppEvent(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        // No event type configured — nothing to check.
+        if (!config.eventType) return { items: [], lastSeenId };
+
+        switch (config.appType) {
+            case 'basecamp': return this.pollBasecamp(config, since, lastSeenId);
+            case 'slack':    return this.pollSlack(config, since, lastSeenId);
+            case 'gmail':    return this.pollGmail(config, since, lastSeenId);
+            case 'gdrive':   return this.pollGDrive(config, since, lastSeenId);
+            case 'gsheets':  return this.pollGSheets(config, since, lastSeenId);
+            default:
+                return { items: [], lastSeenId };
+        }
+    }
+
+    private async pollBasecamp(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        const { credentialId, projectId, todolistId, eventType } = config;
+        if (!credentialId) return { items: [], lastSeenId };
+
+        const token = await this.basecampAuth.getToken(credentialId);
+        const accountId = await this.basecampAuth.getAccountId(credentialId);
+        const baseUrl = `https://3.basecampapi.com/${accountId}`;
+        const headers: Record<string, string> = {
+            Authorization: `Bearer ${token}`,
+            'User-Agent': 'WorkflowAutomation (hello@example.com)',
+            'Content-Type': 'application/json',
+        };
+
+        const sinceMs = since.getTime();
+
+        // ── Todo completed ───────────────────────────────────────────────
+        // Completed todos are filtered by updated_at (set when the todo is
+        // checked off) because Basecamp does not expose a dedicated
+        // completed_at timestamp in the list endpoint.
+        if (eventType === 'todo_completed' && todolistId) {
+            const url = `${baseUrl}/todolists/${todolistId}/todos.json?completed=true`;
+            const allItems = await this.fetchAllPages(url, headers);
+            const newItems = allItems.filter((item) => {
+                const updated = new Date((item.updated_at ?? item.created_at) as string).getTime();
+                return updated > sinceMs;
+            });
+            const newLastSeen = newItems.length > 0 ? String(newItems[0].id ?? lastSeenId) : lastSeenId;
+            return {
+                items: newItems.map((item) => ({ ...item, _eventType: 'todo_completed', _todolistId: todolistId })),
+                lastSeenId: newLastSeen,
+            };
+        }
+
+        let url: string;
+        if (eventType === 'new_todo' && todolistId) {
+            url = `${baseUrl}/todolists/${todolistId}/todos.json`;
+        } else if (eventType === 'new_message' && projectId) {
+            url = `${baseUrl}/buckets/${projectId}/messages.json`;
+        } else if (eventType === 'new_comment' && projectId) {
+            url = `${baseUrl}/buckets/${projectId}/recordings/comments.json`;
+        } else {
+            return { items: [], lastSeenId };
+        }
+
+        const allItems = await this.fetchAllPages(url, headers);
+        const newItems = allItems.filter((item) => {
+            const created = new Date(item.created_at as string).getTime();
+            return created > sinceMs;
+        });
+
+        const newLastSeen = newItems.length > 0
+            ? String(newItems[0].id ?? lastSeenId)
+            : lastSeenId;
+
+        return { items: newItems, lastSeenId: newLastSeen };
+    }
+
+    private async pollSlack(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        const { credentialId, eventType, slackChannelId } = config;
+        if (!credentialId) return { items: [], lastSeenId };
+
+        const token = await this.slackAuth.getToken(credentialId);
+        const oldest = String(since.getTime() / 1000);
+        const authHdr = { Authorization: `Bearer ${token}` };
+
+        // ── New user joined ──────────────────────────────────────────────
+        if (eventType === 'new_user') {
+            const res = await fetch('https://slack.com/api/users.list', { headers: authHdr });
+            if (!res.ok) return { items: [], lastSeenId };
+            const data = await res.json() as { members?: Array<Record<string, unknown>> };
+            const users = (data.members ?? []).filter((u) => {
+                const updated = (u.updated as number) ?? 0;
+                return updated > since.getTime() / 1000 && !u.is_bot && u.id !== 'USLACKBOT';
+            });
+            const newLastSeen = users.length > 0 ? String(users[0].id ?? lastSeenId) : lastSeenId;
+            return { items: users, lastSeenId: newLastSeen };
+        }
+
+        // ── New public channel created ───────────────────────────────────
+        if (eventType === 'new_public_channel') {
+            const res = await fetch(
+                `https://slack.com/api/conversations.list?types=public_channel&exclude_archived=true&limit=200`,
+                { headers: authHdr },
+            );
+            if (!res.ok) return { items: [], lastSeenId };
+            const data = await res.json() as { channels?: Array<Record<string, unknown>> };
+            const channels = (data.channels ?? []).filter((ch) => {
+                const created = (ch.created as number) ?? 0;
+                return created > since.getTime() / 1000;
+            });
+            const newLastSeen = channels.length > 0 ? String(channels[0].id ?? lastSeenId) : lastSeenId;
+            return { items: channels, lastSeenId: newLastSeen };
+        }
+
+        // ── File made public ─────────────────────────────────────────────
+        if (eventType === 'file_public') {
+            const res = await fetch(
+                `https://slack.com/api/files.list?ts_from=${oldest}&types=all&count=20`,
+                { headers: authHdr },
+            );
+            if (!res.ok) return { items: [], lastSeenId };
+            const data = await res.json() as { files?: Array<Record<string, unknown>> };
+            const files = (data.files ?? []).filter((f) => f.is_public === true);
+            const newLastSeen = files.length > 0 ? String(files[0].id ?? lastSeenId) : lastSeenId;
+            return { items: files, lastSeenId: newLastSeen };
+        }
+
+        // ── File shared ──────────────────────────────────────────────────
+        if (eventType === 'file_shared') {
+            const res = await fetch(
+                `https://slack.com/api/files.list?ts_from=${oldest}&types=all&count=20`,
+                { headers: authHdr },
+            );
+            if (!res.ok) return { items: [], lastSeenId };
+            const data = await res.json() as { files?: Array<Record<string, unknown>> };
+            const files = data.files ?? [];
+            const newLastSeen = files.length > 0 ? String(files[0].id ?? lastSeenId) : lastSeenId;
+            return { items: files, lastSeenId: newLastSeen };
+        }
+
+        // ── Message-based events (any_event, new_message, app_mention, reaction_added) ──
+        // Any event type not handled above returns empty — no spurious triggers.
+        const MESSAGE_EVENTS = new Set(['any_event', 'new_message', 'app_mention', 'reaction_added']);
+        if (!MESSAGE_EVENTS.has(eventType ?? '')) return { items: [], lastSeenId };
+
+        // Resolve which channels to scan
+        let channelIds: string[] = [];
+        if (slackChannelId) {
+            channelIds = [slackChannelId];
+        } else {
+            const listRes = await fetch(
+                'https://slack.com/api/conversations.list?types=public_channel&exclude_archived=true&limit=100',
+                { headers: authHdr },
+            );
+            if (listRes.ok) {
+                const listData = await listRes.json() as { channels?: Array<{ id: string }> };
+                channelIds = (listData.channels ?? []).slice(0, 10).map((c) => c.id);
+            }
+        }
+
+        // Resolve bot user ID for app_mention filtering
+        let botUserId = '';
+        if (eventType === 'app_mention') {
+            const authRes = await fetch('https://slack.com/api/auth.test', { headers: authHdr });
+            if (authRes.ok) {
+                const authData = await authRes.json() as { user_id?: string };
+                botUserId = authData.user_id ?? '';
+            }
+        }
+
+        const newItems: Array<Record<string, unknown>> = [];
+        let latestTs = lastSeenId;
+
+        for (const chId of channelIds) {
+            const histRes = await fetch(
+                `https://slack.com/api/conversations.history?channel=${chId}&oldest=${oldest}&limit=50`,
+                { headers: authHdr },
+            );
+            if (!histRes.ok) continue;
+            const histData = await histRes.json() as { messages?: Array<Record<string, unknown>> };
+            const messages = histData.messages ?? [];
+
+            for (const msg of messages) {
+                const ts = msg.ts as string;
+
+                if (eventType === 'app_mention') {
+                    if (botUserId && !(msg.text as string ?? '').includes(`<@${botUserId}>`)) continue;
+                    newItems.push({ ...msg, _channel: chId, _eventType: eventType });
+                } else if (eventType === 'reaction_added') {
+                    // Emit one item per reaction so each reaction is individually accessible.
+                    const reactions = Array.isArray(msg.reactions)
+                        ? (msg.reactions as Array<Record<string, unknown>>)
+                        : [];
+                    if (reactions.length === 0) continue;
+                    for (const reaction of reactions) {
+                        newItems.push({
+                            ...msg,
+                            _channel:       chId,
+                            _eventType:     'reaction_added',
+                            _reaction:      reaction,
+                            _reactionName:  reaction.name,
+                            _reactionCount: reaction.count,
+                            _reactionUsers: reaction.users,
+                        });
+                    }
+                } else {
+                    newItems.push({ ...msg, _channel: chId, _eventType: eventType });
+                }
+
+                if (ts && ts > latestTs) latestTs = ts;
+            }
+        }
+
+        return { items: newItems, lastSeenId: latestTs };
+    }
+
+    private async pollGDrive(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        const { credentialId, eventType, fileId, folderId } = config;
+        if (!credentialId) return { items: [], lastSeenId };
+
+        // Only the two supported Drive event types do anything.
+        if (eventType !== 'file_changed' && eventType !== 'folder_changed') {
+            return { items: [], lastSeenId };
+        }
+
+        const client = await this.googleAuth.getAuthenticatedClient(credentialId);
+        const token = (await client.getAccessToken()).token;
+        if (!token) return { items: [], lastSeenId };
+
+        const authHdr = { Authorization: `Bearer ${token}` };
+
+        // ── Changes to a specific file ───────────────────────────────────
+        if (eventType === 'file_changed' && fileId) {
+            const fields = [
+                'id', 'name', 'mimeType', 'size', 'modifiedTime', 'createdTime', 'version',
+                'lastModifyingUser', 'owners', 'shared', 'sharingUser',
+                'webViewLink', 'webContentLink', 'iconLink',
+                'description', 'parents',
+                'capabilities', 'permissions',
+            ].join(',');
+            const res = await fetch(
+                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=${fields}&supportsAllDrives=true`,
+                { headers: authHdr },
+            );
+            if (!res.ok) return { items: [], lastSeenId };
+            const file = await res.json() as Record<string, unknown>;
+            const modifiedTime = file.modifiedTime ? new Date(file.modifiedTime as string) : null;
+            const currentVersion = String(file.version ?? '');
+
+            if (modifiedTime && modifiedTime > since && currentVersion !== lastSeenId) {
+                return { items: [{ ...file, _eventType: 'file_changed', _fileId: fileId }], lastSeenId: currentVersion };
+            }
+            return { items: [], lastSeenId: currentVersion || lastSeenId };
+        }
+
+        // ── Changes involving a specific folder ──────────────────────────
+        if (eventType === 'folder_changed' && folderId) {
+            const sinceISO = since.toISOString();
+            const query = encodeURIComponent(`'${folderId}' in parents and modifiedTime > '${sinceISO}' and trashed = false`);
+            const fileFields = [
+                'id', 'name', 'modifiedTime', 'createdTime', 'mimeType', 'size',
+                'lastModifyingUser', 'owners', 'shared', 'webViewLink', 'iconLink',
+            ].join(',');
+            const res = await fetch(
+                `https://www.googleapis.com/drive/v3/files?q=${query}` +
+                `&fields=files(${fileFields})&orderBy=modifiedTime+desc&pageSize=50` +
+                `&supportsAllDrives=true&includeItemsFromAllDrives=true`,
+                { headers: authHdr },
+            );
+            if (!res.ok) return { items: [], lastSeenId };
+            const data = await res.json() as { files?: Array<Record<string, unknown>> };
+            const files = (data.files ?? []).map((f) => ({ ...f, _eventType: 'folder_changed', _folderId: folderId } as Record<string, unknown>));
+            const newLastSeen = files.length > 0 ? String(files[0].id ?? lastSeenId) : lastSeenId;
+            return { items: files, lastSeenId: newLastSeen };
+        }
+
+        return { items: [], lastSeenId };
+    }
+
+    private async pollGSheets(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        const { credentialId, spreadsheetId, sheetName, eventType } = config;
+        if (!credentialId || !spreadsheetId) return { items: [], lastSeenId };
+
+        const client = await this.googleAuth.getAuthenticatedClient(credentialId);
+        const token = (await client.getAccessToken()).token;
+        if (!token) return { items: [], lastSeenId };
+
+        const authHdr = { Authorization: `Bearer ${token}` };
+
+        // Check if the spreadsheet file was modified since last poll
+        const driveRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${spreadsheetId}?fields=id,modifiedTime,version`,
+            { headers: authHdr },
+        );
+        if (!driveRes.ok) return { items: [], lastSeenId };
+        const fileInfo = await driveRes.json() as { modifiedTime?: string; version?: string };
+        const modifiedTime = fileInfo.modifiedTime ? new Date(fileInfo.modifiedTime) : null;
+        const currentVersion = String(fileInfo.version ?? '');
+
+        // Parse stored state: "rowCount|version"
+        const [storedCountStr, storedVersion] = lastSeenId ? lastSeenId.split('|') : ['', ''];
+        const lastRowCount = storedCountStr ? parseInt(storedCountStr, 10) : -1;
+
+        // If not modified and version unchanged, nothing to do
+        if (modifiedTime && modifiedTime <= since && currentVersion === storedVersion) {
+            return { items: [], lastSeenId };
+        }
+
+        // Only fetch sheet data for the three supported event types.
+        const SHEET_EVENTS = new Set(['row_added', 'row_updated', 'row_added_or_updated']);
+        if (!SHEET_EVENTS.has(eventType ?? '')) return { items: [], lastSeenId };
+
+        // Fetch current sheet data
+        const range = sheetName ? `${encodeURIComponent(sheetName)}!A:Z` : 'Sheet1!A:Z';
+        const sheetsRes = await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`,
+            { headers: authHdr },
+        );
+        if (!sheetsRes.ok) return { items: [], lastSeenId: `0|${currentVersion}` };
+        const sheetsData = await sheetsRes.json() as { values?: string[][] };
+        const rows = sheetsData.values ?? [];
+        const headers = rows[0] ?? [];
+        const dataRows = rows.slice(1);
+        const currentCount = dataRows.length;
+        const newStateId = `${currentCount}|${currentVersion}`;
+
+        // First run — initialise cursor without triggering
+        if (lastRowCount === -1) {
+            return { items: [], lastSeenId: newStateId };
+        }
+
+        const resolvedSheetName = sheetName || 'Sheet1';
+        const mapRow = (row: string[], index: number, label: string): Record<string, unknown> => {
+            const obj: Record<string, unknown> = {
+                _rowIndex:      index + 2,
+                _eventType:     label,
+                _spreadsheetId: spreadsheetId,
+                _sheetName:     resolvedSheetName,
+            };
+            headers.forEach((h, j) => { const key = h?.trim(); obj[key || `col${j + 1}`] = row[j] ?? ''; });
+            return obj;
+        };
+
+        let items: Array<Record<string, unknown>> = [];
+
+        if (eventType === 'row_added') {
+            if (currentCount > lastRowCount) {
+                items = dataRows.slice(lastRowCount).map((row, i) =>
+                    mapRow(row, lastRowCount + i, 'row_added'));
+            }
+        } else if (eventType === 'row_updated') {
+            // Detect update when file modified but row count unchanged
+            if (currentCount <= lastRowCount && currentVersion !== storedVersion) {
+                items = dataRows.map((row, i) => mapRow(row, i, 'row_updated'));
+            }
+        } else if (eventType === 'row_added_or_updated') {
+            if (currentCount > lastRowCount) {
+                // New rows were added
+                items = dataRows.slice(lastRowCount).map((row, i) =>
+                    mapRow(row, lastRowCount + i, 'row_added'));
+            } else if (currentVersion !== storedVersion) {
+                // Same row count but file changed — rows were updated
+                items = dataRows.map((row, i) => mapRow(row, i, 'row_updated'));
+            }
+        }
+
+        return { items, lastSeenId: newStateId };
+    }
+
+    private async pollGmail(
+        config: TriggerNodeConfig,
+        since: Date,
+        lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        return this.pollEmail(config, since, lastSeenId);
+    }
+
+    // ── Email (Gmail) Adapter ────────────────────────────────────────────
+
+    private async pollEmail(
+        config: TriggerNodeConfig,
+        since: Date,
+        _lastSeenId: string,
+    ): Promise<{ items: Array<Record<string, unknown>>; lastSeenId: string }> {
+        const { credentialId, labelFilter } = config;
+        if (!credentialId) return { items: [], lastSeenId: _lastSeenId };
+
+        const client = await this.googleAuth.getAuthenticatedClient(credentialId);
+        const token = (await client.getAccessToken()).token;
+        if (!token) return { items: [], lastSeenId: _lastSeenId };
+
+        const afterEpoch = Math.floor(since.getTime() / 1000);
+        const query = `after:${afterEpoch}${labelFilter ? ` label:${labelFilter}` : ''}`;
+
+        const listRes = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=20`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+
+        if (!listRes.ok) return { items: [], lastSeenId: _lastSeenId };
+        const listData = await listRes.json() as { messages?: Array<{ id: string }> };
+        const messageIds = (listData.messages ?? []).map((m) => m.id);
+
+        // Filter out already-seen messages
+        const newIds = _lastSeenId
+            ? messageIds.filter((id) => id > _lastSeenId)
+            : messageIds;
+
+        const items: Array<Record<string, unknown>> = [];
+        for (const id of newIds.slice(0, 10)) {
+            const msgRes = await fetch(
+                `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata`,
+                { headers: { Authorization: `Bearer ${token}` } },
+            );
+            if (msgRes.ok) {
+                items.push(await msgRes.json() as Record<string, unknown>);
+            }
+        }
+
+        const newLastSeen = newIds.length > 0 ? newIds[0] : _lastSeenId;
+        return { items, lastSeenId: newLastSeen };
+    }
+
+    // ── Pagination helper ────────────────────────────────────────────────
+
+    private async fetchAllPages(
+        startUrl: string,
+        headers: Record<string, string>,
+    ): Promise<Array<Record<string, unknown>>> {
+        const results: Array<Record<string, unknown>> = [];
+        let nextUrl: string | null = startUrl;
+
+        while (nextUrl) {
+            const res: Response = await fetch(nextUrl, { headers });
+            if (!res.ok) break;
+            const page = await res.json() as Array<Record<string, unknown>>;
+            results.push(...page);
+
+            const linkHeader: string = res.headers.get('Link') ?? '';
+            const nextMatch: RegExpMatchArray | null = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+            nextUrl = nextMatch ? nextMatch[1] : null;
+        }
+
+        return results;
+    }
+}

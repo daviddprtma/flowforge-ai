@@ -1,0 +1,49 @@
+{
+  "name": "flowforge-ai",
+  "version": "1.0.0",
+  "description": "An AI-powered workflow automation platform built with Node.js, Fastify, and various AI services.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "author": "David Pratama",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
+    "@fastify/cors": "^11.2.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/sensible": "^6.0.4",
+    "@fastify/static": "^9.0.0",
+    "@google/generative-ai": "^0.24.1",
+    "@slack/web-api": "^7.15.0",
+    "bullmq": "^5.71.1",
+    "cron-parser": "^5.5.0",
+    "dotenv": "^17.3.1",
+    "fastify": "^5.8.2",
+    "googleapis": "^171.4.0",
+    "ioredis": "^5.10.1",
+    "jsonpath-plus": "^10.4.0",
+    "mongoose": "^9.3.2",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.5",
+    "openai": "^6.31.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/jsonpath-plus": "^5.0.5",
+    "@types/node": "^25.5.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^8.0.0",
+    "@vitest/coverage-v8": "^4.1.5",
+    "vitest": "4.1.5"
+  }
+}

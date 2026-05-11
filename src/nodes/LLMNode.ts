@@ -1,0 +1,53 @@
+import { NodeExecutor } from "../engine/NodeExecutor";
+import { WorkflowNode, ExecutionContext } from "../types/workflow.types";
+import { LLMConfig, LLMResponse } from "../types/llm.types";
+import { LLMProviderFactory } from "../llm/LLMProviderFactory";
+import { ChatMemoryManager } from "../llm/ChatMemoryManager";
+import { isLLMNodeConfig } from '../utils/guards';
+import { ExpressionResolver } from "../engine/ExpressionResolver";
+
+export class LLMNode implements NodeExecutor {
+    private resolver = new ExpressionResolver();
+
+    constructor(private memoryManager: ChatMemoryManager) {}
+
+    async execute(node: WorkflowNode, context: ExecutionContext): Promise<LLMResponse> {
+        if (!isLLMNodeConfig(node.config)) {
+            throw new Error(`Node "${node.id}" has an invalid or incomplete LLM config`);
+        }
+
+        const config = node.config;
+        
+        const provider = LLMProviderFactory.create(config.provider);
+
+        const memory = this.memoryManager.getOrCreate(context.executionId);
+
+        if (config.systemPrompt && memory.messages.length === 0) {
+            this.memoryManager.addMessage(context.executionId, {
+                role: 'system',
+                content: this.resolver.resolveTemplate(config.systemPrompt, context),
+            });
+        }
+
+        const resolvedPrompt = this.resolver.resolveTemplate(config.userPrompt, context);
+
+        this.memoryManager.addMessage(context.executionId, {
+            role: 'user',
+            content: resolvedPrompt,
+        });
+
+        const response = await provider.complete(
+            memory.messages,
+            config.model,
+            config.temperature,
+            config.maxTokens
+        );
+
+        this.memoryManager.addMessage(context.executionId, {
+            role: 'assistant',
+            content: response.content,
+        });
+
+        return response;
+    }
+}

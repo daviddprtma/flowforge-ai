@@ -1,0 +1,198 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* ── Theme variables ──────────────────────────────────────────────────────── */
+:root {
+  --glass-bg: linear-gradient(135deg, rgba(255,255,255,0.88) 0%, rgba(248,250,252,0.78) 100%);
+  --glass-bg-soft: rgba(255,255,255,0.80);
+  --glass-border: rgba(15,23,42,0.09);
+  --glass-shadow-inner: rgba(255,255,255,0.70);
+  --glass-shadow-outer: rgba(0,0,0,0.06);
+  --glass-divider: rgba(15,23,42,0.12);
+  --body-bg: #f1f5f9;
+}
+
+.dark {
+  --glass-bg: #1E293B;
+  --glass-bg-soft: #1E293B;
+  --glass-border: rgba(148,163,184,0.16);
+  --glass-shadow-inner: rgba(255,255,255,0.05);
+  --glass-shadow-outer: rgba(2,6,23,0.35);
+  --glass-divider: rgba(148,163,184,0.22);
+  --body-bg: #020617;
+}
+
+body {
+  margin: 0;
+  font-family: 'Poppins', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  background: var(--body-bg);
+}
+
+/* ── Shared glassmorphism surfaces ─────────────────────────────────────────── */
+.glass-surface {
+  background: var(--glass-bg);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    inset 0 1px 0 var(--glass-shadow-inner),
+    0 10px 30px var(--glass-shadow-outer);
+}
+
+.glass-surface-soft {
+  background: var(--glass-bg-soft);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--glass-border);
+}
+
+.glass-divider {
+  background: var(--glass-divider);
+}
+
+/* React Flow overrides */
+.react-flow__node {
+  cursor: default;
+}
+
+/* ── Thin custom scrollbar for the node picker popup ───────────────────── */
+.scrollbar-thin::-webkit-scrollbar          { width: 4px; }
+.scrollbar-thin::-webkit-scrollbar-track    { background: transparent; }
+.scrollbar-thin::-webkit-scrollbar-thumb    { background: rgba(0,0,0,0.10); border-radius: 99px; }
+.scrollbar-thin:hover::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.20); }
+
+.dark .scrollbar-thin::-webkit-scrollbar-thumb    { background: rgba(255,255,255,0.10); }
+.dark .scrollbar-thin:hover::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.20); }
+
+/* ── Execution edge: progress-bar sweep ───────────────────────────────
+   Uses normalised pathLength="1" on the SVG path element.
+   stroke-dasharray:"1" means one dash covering the full path.
+   Animating stroke-dashoffset from 1→0 draws the line from source to
+   target (the classic SVG "draw path" technique).
+   Opacity fades in at 6 % and out at 85 % so the loop restart
+   (instant jump back to dashoffset:1) is never visible.
+──────────────────────────────────────────────────────────────────── */
+@keyframes edgeProgressSweep {
+  0%   { stroke-dashoffset: 1; stroke-opacity: 0;   }
+  6%   { stroke-dashoffset: 0.94; stroke-opacity: 1; }
+  82%  { stroke-dashoffset: 0;    stroke-opacity: 1; }
+  100% { stroke-dashoffset: 0;    stroke-opacity: 0; }
+}
+
+.edge-progress-sweep {
+  stroke-dasharray: 1;
+  animation: edgeProgressSweep 1.15s cubic-bezier(0.4, 0, 0.55, 1) infinite;
+}
+
+/* ── Execution edge: selected-state marching dashes ───────────────────
+   Animates stroke-dashoffset so the dashes appear to march along the
+   connector, giving clear feedback that the edge is selected and ready
+   to be deleted (press Delete/Backspace).
+──────────────────────────────────────────────────────────────────── */
+@keyframes edgeSelectionMarch {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -20; }
+}
+
+/* ── React Flow controls – light mode ──────────────────────────────── */
+.react-flow__controls button {
+  background-color: #ffffff;
+  border-color: #e2e8f0;
+  color: #475569;
+}
+
+.react-flow__controls button:hover {
+  background-color: #f1f5f9;
+}
+
+/* ── React Flow controls – dark mode ───────────────────────────────── */
+.dark .react-flow__controls button {
+  background-color: #1e293b;
+  border-color: #475569;
+  color: #cbd5e1;
+}
+
+.dark .react-flow__controls button:hover {
+  background-color: #334155;
+}
+
+/* ── Sign-in page: lightweight agentic workflow vectors ───────────────────── */
+@keyframes agentFloatSlow {
+  0%, 100% { transform: translateY(0px); }
+  50%      { transform: translateY(-8px); }
+}
+
+@keyframes agentFloatFast {
+  0%, 100% { transform: translateY(0px); }
+  50%      { transform: translateY(7px); }
+}
+
+@keyframes agentDashFlow {
+  to { stroke-dashoffset: -54; }
+}
+
+@keyframes agentNodePulse {
+  0%, 100% { opacity: 0.88; }
+  50%      { opacity: 1; }
+}
+
+.agent-float-slow {
+  animation: agentFloatSlow 8s ease-in-out infinite;
+}
+
+.agent-float-fast {
+  animation: agentFloatFast 6.5s ease-in-out infinite;
+}
+
+.agent-flow-path,
+.agent-flow-path-delay {
+  stroke-dasharray: 7 8;
+  animation: agentDashFlow 2.4s linear infinite;
+}
+
+.agent-flow-path-delay {
+  animation-delay: 0.7s;
+}
+
+.agent-node-pulse {
+  animation: agentNodePulse 2.2s ease-in-out infinite;
+}
+
+@keyframes agentRingSpin {
+  from { transform: rotate(0deg); transform-origin: 835px 332px; }
+  to   { transform: rotate(360deg); transform-origin: 835px 332px; }
+}
+
+@keyframes agentCircuitPulse {
+  0%, 100% { opacity: 0.7; }
+  50%      { opacity: 1; }
+}
+
+.agent-ring-spin {
+  stroke-dasharray: 15 10;
+  animation: agentRingSpin 14s linear infinite;
+}
+
+.agent-circuit-pulse {
+  animation: agentCircuitPulse 2.6s ease-in-out infinite;
+}
+
+/* ── Product tour: spotlight pulse ring ──────────────────────────────────── */
+@keyframes tourPulse {
+  0%   { opacity: 1;   transform: scale(1);    }
+  70%  { opacity: 0;   transform: scale(1.06); }
+  100% { opacity: 0;   transform: scale(1.06); }
+}
