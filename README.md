@@ -85,7 +85,7 @@ Read this section about how to get start with this FlowForge AI
    cd frontend && npm run dev
    ```
 
-Open http://localhost:5173 in your browser.
+   Open http://localhost:5173 in your browser.
 
 5. Production build
    ```sh
