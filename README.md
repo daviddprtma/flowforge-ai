@@ -1,9 +1,8 @@
 
 <br/>
 <div align="center">
-<a href="https://github.com/ShaanCoding/ReadME-Generator">
-<img src="https://raw.githubusercontent.com/daviddprtma/flowforge-ai/refs/heads/main/frontend/public/logo.png?token=GHSAT0AAAAAADXQ2JK6EUG2CJRXIJFGHBHA2QCTHOA" alt="Logo" width="80" height="80">
-</a>
+<img src="https://raw.githubusercontent.com/daviddprtma/flowforge-ai/refs/heads/main/frontend/public/logo.png" alt="Logo" width="80" height="80">
+
 <h3 align="center">FlowForge AI</h3>
 <p align="center">
 An AI-powered workflow automation platform built with Node.js, Fastify, and various AI services.
